@@ -72,6 +72,85 @@ No `maxDescriptor* does not meet requirements` lines. No `Your graphics
 device does not meet minimum requirements`. The engine accepted the
 GPU, loaded the menu scene, brought up networking.
 
+## Kernel panic 2026-05-07
+
+After ~26 minutes of stable runtime in the menu, loading a sandbox
+scene (citizens + weapons + props) caused this progression in
+sbox.log:
+
+```
+2026/05/07 08:57:49.7546  [engine/RenderSystem] FrameSync() - bailing out of vkWaitForFences( fenceCount = 1 ) after 0.252179 seconds, error = VK_TIMEOUT
+2026/05/07 08:57:49.7589  [engine/Engine] CSwapChainBase::QueuePresentAndWait() looped for 21 iterations without a present event.
+2026/05/07 08:57:50.0023  [engine/Engine] CSwapChainBase::QueuePresentAndWait() looped for 21 iterations without a present event.
+2026/05/07 08:57:50.0282  [engine/RenderSystem] FrameSync() - bailing out of vkWaitForFences( fenceCount = 2 ) after 0.250293 seconds, error = VK_TIMEOUT
+```
+
+sbox.log went silent for 5 minutes. Frame frozen. After force-killing
+the wine session, mouse + keyboard recovered.
+
+Lowered patch limits to a conservative `131,072 / 4,096`. Probe
+confirmed those numbers post-rebuild. Relaunched. About 2 minutes
+into a sandbox scene, **Mac rebooted with a kernel panic.**
+
+Panic log
+(`/Library/Logs/DiagnosticReports/panic-full-2026-05-07-091339.0002.panic`)
+key fields:
+
+```
+"panicString" : "panic(cpu 0 caller 0xfffffe003b8fc3e4): userspace
+watchdog timeout: no successful checkins from WindowServer (2 induced
+crashes) in 120 seconds"
+```
+
+Sequence (from /Library/Logs/DiagnosticReports/ timestamps):
+
+| Time | Event |
+|---|---|
+| 09:11:58 | WindowServer .ips report |
+| 09:12:02 | WindowServer userspace_watchdog_timeout (induced crash 1) |
+| 09:12:38 | WindowServer .ips report |
+| 09:12:39 | WindowServer userspace_watchdog_timeout (induced crash 2) |
+| 09:13:39 | **kernel panic** |
+| 09:13:41 | reset |
+
+Backtrace ends in `com.apple.driver.AppleARMWatchdogTimer`. Among
+threads listed in the panic stackshot: `sbox.exe` with `cpu_usage
+3,517,006`, hot at the time of the panic.
+
+### Interpretation
+
+The patched MoltenVK lets s&box *think* it can allocate up to the
+patched values per descriptor set. Under heavy scene load, the engine
+takes us up on it and submits enough Vulkan work that Metal can't
+service WindowServer's compositor frames. macOS's kernel watchdog
+gives WindowServer two chances to recover, then panics protectively.
+
+This is **not** a memory bug or numerical issue in our patch — it's
+a GPU contention issue caused by raising the perceived headroom too
+far. Lowering values from 1,000,000 to 131,072 didn't help because
+even 131,072 is still ~100× the actual descriptor pressure that
+keeps the GPU shareable with the compositor.
+
+### Next steps
+
+In order:
+
+1. **Control test.** Drop in vanilla MoltenVK 1.4.1 (no patch).
+   Confirm the descriptor-limit gate kills s&box at startup with no
+   GPU stress and no panic. This isolates whether the panic is
+   patch-induced vs. some other interaction (Wineskin/Sikarugir
+   stability, Steam under wine, etc.).
+2. **If control is clean**, retry with absolute-minimum patch values
+   — `65,537 / 2,049`, literally one above the engine's stated
+   minimum. Combine with:
+   - `MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE` set
+     lower than default to throttle concurrent command-buffer load.
+   - s&box `cfg/video.txt` forced to lowest quality + windowed mode
+     before launching, to reduce per-frame GPU work.
+3. **If that still panics**, the conclusion is that this approach
+   isn't safe on M4 Pro for s&box's scene load. Roll back to vanilla
+   MoltenVK and update this repo to that effect.
+
 ## Reproducing
 
 Anyone with similar hardware can rerun the probe — see
@@ -81,3 +160,6 @@ probe verification command.
 If your MacBook reports something different, please open an issue
 with: chip model, macOS version, MoltenVK commit, and the full probe
 output for both vanilla and patched dylibs.
+
+If the patch panics your machine, please file an issue with the
+panic-full log so we can correlate failure modes.

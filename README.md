@@ -4,6 +4,37 @@
 MoltenVK to surface argument-buffer-actual descriptor limits to apps
 that don't enable `VK_EXT_descriptor_indexing`.
 
+> ## ⚠️ Stability warning — read before applying
+>
+> **The patch as originally published triggered a macOS kernel panic
+> on M4 Pro when s&box loaded a full sandbox scene.** WindowServer
+> (the macOS compositor) couldn't get GPU time, Apple's kernel
+> watchdog killed it twice, then panicked the system after 120
+> seconds of compositor silence. The Mac rebooted cleanly with a
+> crash report — no data loss in this case — but this is real risk.
+> Don't run this on a machine where an unexpected reboot would cost
+> you something.
+>
+> Symptom progression observed 2026-05-07:
+> 1. Game launches, main menu loads, scene loads — runs fine for
+>    tens of minutes.
+> 2. Frame fences start timing out (`VK_TIMEOUT` on `vkWaitForFences`).
+>    Frozen frame.
+> 3. Keyboard stops responding, then mouse, then black screen.
+> 4. Kernel panic and reboot ~2 minutes after the first fence timeout.
+>
+> Cause appears to be: the patch lets the engine *think* it can
+> allocate millions of descriptors per set; the engine takes us up on
+> it; Metal can technically back the arg-buffer allocations but at
+> rates that completely starve WindowServer of GPU time. Lowering the
+> patch values to "conservative" (131,072/4,096) didn't avert the
+> panic on the second test.
+>
+> See [`docs/EVIDENCE.md`](docs/EVIDENCE.md#kernel-panic-2026-05-07)
+> for the actual panic log and the planned next steps. **Until that
+> is resolved, treat this repo as a diagnosis writeup, not a
+> turn-key fix.**
+
 ## TL;DR
 
 s&box (Source 2, Vulkan-native) ships with a launch gate that requires
