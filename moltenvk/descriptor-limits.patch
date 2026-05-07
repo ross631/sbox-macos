@@ -1,0 +1,26 @@
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+index 6ef812d..ecf871c 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm
+@@ -2884,6 +2884,21 @@
+ 	_properties.limits.maxDescriptorSetStorageImages = (_properties.limits.maxPerStageDescriptorStorageImages * 5);
+ 	_properties.limits.maxDescriptorSetInputAttachments = (_properties.limits.maxPerStageDescriptorInputAttachments * 5);
+ 
++	// sbox-rollyourown patch: surface arg-buffer-actual descriptor limits in
++	// base properties so Vulkan-1.0 apps that don't enable VK_EXT_descriptor_indexing
++	// (e.g. Source 2 / s&box) see realistic numbers. Tier2+argbuf can back ~1M
++	// descriptors per set; sampler ceiling is the actual Metal value, identical
++	// to what getMaxSamplerCount() already returns elsewhere in this file.
++	if (_isUsingMetalArgumentBuffers && isTier2MetalArgumentBuffers()) {
++		uint32_t argBufSamplerMax = (uint32_t)_mtlDevice.maxArgumentBufferSamplerCount;
++		_properties.limits.maxPerStageDescriptorSampledImages = 1000000;
++		_properties.limits.maxPerStageDescriptorStorageImages = 1000000;
++		_properties.limits.maxPerStageDescriptorSamplers      = argBufSamplerMax;
++		_properties.limits.maxDescriptorSetSampledImages      = 1000000;
++		_properties.limits.maxDescriptorSetStorageImages      = 1000000;
++		_properties.limits.maxDescriptorSetSamplers           = argBufSamplerMax;
++	}
++
+ 	_properties.limits.maxClipDistances = 8;	// Per Apple engineers.
+ 	_properties.limits.maxCullDistances = 0;	// unsupported
+ 	_properties.limits.maxCombinedClipAndCullDistances = max(_properties.limits.maxClipDistances,

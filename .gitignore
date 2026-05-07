@@ -1,0 +1,9 @@
+# Build artifacts
+wine-wrapper/wine
+wine-wrapper/wineserver
+probe/probe
+probe/libMoltenVK.dylib
+probe/headers
+
+# macOS junk
+.DS_Store
