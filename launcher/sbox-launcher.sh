@@ -59,11 +59,48 @@ export MVK_CONFIG_EMULATE_SINGLE_TEXEL_ALIGNMENT=0
 export MVK_CONFIG_API_VERSION_TO_ADVERTISE=4210688
 export MVK_CONFIG_RESUME_LOST_DEVICE=1
 
+# Throttle GPU command-buffer concurrency. Default 64 was enough to
+# starve WindowServer when sbox loaded a sandbox scene; 4 leaves more
+# room for the compositor. Did not avert the failure mode in our
+# testing, but reduces severity. See docs/CONCLUSION.md.
+export MVK_CONFIG_MAX_ACTIVE_METAL_COMMAND_BUFFERS_PER_QUEUE=4
+export MVK_CONFIG_SYNCHRONOUS_QUEUE_SUBMITS=1
+
 # Steam.exe is x86_64 Windows; spawned via Rosetta. Without this, AVX is
 # hidden in CPUID and Source 2 bails before the renderer loads.
 export ROSETTA_ADVERTISE_AVX=1
 
 echo "Env primed. Launching Steam through wrapper at $WINE_WRAPPER_BIN"
+
+# Self-kill watchdog: tails sbox.log for the pre-panic distress signals
+# and force-kills the wine session before macOS's WindowServer watchdog
+# fires. Earlier session showed ~5 min between first VK_TIMEOUT and the
+# kernel-panic reboot; this watchdog kills within seconds.
+#
+# Implementation note: don't use `tail -F | grep -m 1` here — grep -m 1
+# exits on first match, but tail -F never sees SIGPIPE because tail's
+# write loop doesn't flush often enough, so the pipeline hangs. Use
+# `awk` with explicit `exit` instead — awk closes its output, SIGPIPE
+# propagates, tail dies, the && block runs.
+SBOX_LOG="$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/sbox/logs/sbox.log"
+WATCHDOG_TRIGGER="${WATCHDOG_TRIGGER:-/tmp/sbox-watchdog-trigger.txt}"
+rm -f "$WATCHDOG_TRIGGER"
+(
+    while [ ! -f "$SBOX_LOG" ]; do sleep 2; done
+    tail -F "$SBOX_LOG" 2>/dev/null | \
+        awk '/VK_TIMEOUT|FrameSync\(\) - bailing out|QueuePresentAndWait\(\) looped/ {
+            print > "'"$WATCHDOG_TRIGGER"'"
+            fflush()
+            exit
+        }' && {
+            echo "!!! WATCHDOG: detected pre-panic signal — force-killing sbox session" \
+                >> "$LOG"
+            cat "$WATCHDOG_TRIGGER" >> "$LOG"
+            pkill -9 -f "wineserver|sbox\.exe|steam\.exe|steamwebhelper|steamservice"
+        }
+) &
+WATCHDOG_PID=$!
+echo "Self-kill watchdog armed (pid $WATCHDOG_PID); will force-quit on first VK_TIMEOUT / present-loop / FrameSync bail."
 
 # Steam exits 42 to signal "I just self-updated, restart me". On Windows
 # the bootstrap shortcut handles this; under exec'd wine we have to loop
@@ -74,4 +111,7 @@ for i in 1 2 3; do
     echo "--- wine exited $rc (attempt $i) ---"
     [ "$rc" = "42" ] || break
 done
+
+# Tear down the watchdog whether wine exited cleanly or the watchdog killed it.
+kill "$WATCHDOG_PID" 2>/dev/null
 exit "$rc"

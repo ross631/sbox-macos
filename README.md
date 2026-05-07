@@ -1,152 +1,131 @@
 # sbox-macos
 
-**Run [s&box](https://sbox.game) on Apple Silicon Macs** by patching
-MoltenVK to surface argument-buffer-actual descriptor limits to apps
-that don't enable `VK_EXT_descriptor_indexing`.
+> ## ❌ This approach does not work on M4 Pro
+>
+> After three iterations (descriptor limits at 1,000,000 / 131,072 / 65,537)
+> with progressively more conservative MoltenVK throttling and
+> lowest-quality s&box settings, **every patched configuration triggered
+> the same GPU-contention failure mode** when s&box loaded the sandbox
+> gamemode. The first attempt escalated into a macOS kernel panic +
+> reboot. Subsequent attempts hung on the present-event loop within
+> seconds of scene load.
+>
+> **Vanilla MoltenVK fails s&box's launch gate cleanly with no GPU
+> stress and no panic risk.** The patched MoltenVK clears the gate but
+> lets the engine submit Vulkan work that Metal can't service while
+> keeping the macOS compositor (WindowServer) alive.
+>
+> This repo is now a **negative-result diagnosis writeup**, not a
+> turn-key fix. Read it to understand exactly why s&box doesn't run on
+> Apple Silicon today and what would actually fix it upstream. **Don't
+> apply the patch and expect to play.**
+>
+> See [`docs/CONCLUSION.md`](docs/CONCLUSION.md) for the full
+> experimental record and what would need to change for s&box to run
+> properly.
 
-> ## ⚠️ Stability warning — read before applying
->
-> **The patch as originally published triggered a macOS kernel panic
-> on M4 Pro when s&box loaded a full sandbox scene.** WindowServer
-> (the macOS compositor) couldn't get GPU time, Apple's kernel
-> watchdog killed it twice, then panicked the system after 120
-> seconds of compositor silence. The Mac rebooted cleanly with a
-> crash report — no data loss in this case — but this is real risk.
-> Don't run this on a machine where an unexpected reboot would cost
-> you something.
->
-> Symptom progression observed 2026-05-07:
-> 1. Game launches, main menu loads, scene loads — runs fine for
->    tens of minutes.
-> 2. Frame fences start timing out (`VK_TIMEOUT` on `vkWaitForFences`).
->    Frozen frame.
-> 3. Keyboard stops responding, then mouse, then black screen.
-> 4. Kernel panic and reboot ~2 minutes after the first fence timeout.
->
-> Cause appears to be: the patch lets the engine *think* it can
-> allocate millions of descriptors per set; the engine takes us up on
-> it; Metal can technically back the arg-buffer allocations but at
-> rates that completely starve WindowServer of GPU time. Lowering the
-> patch values to "conservative" (131,072/4,096) didn't avert the
-> panic on the second test.
->
-> See [`docs/EVIDENCE.md`](docs/EVIDENCE.md#kernel-panic-2026-05-07)
-> for the actual panic log and the planned next steps. **Until that
-> is resolved, treat this repo as a diagnosis writeup, not a
-> turn-key fix.**
-
-## TL;DR
+## What we tried, what happened
 
 s&box (Source 2, Vulkan-native) ships with a launch gate that requires
 `maxDescriptorSetSampledImages >= 65536` and `maxDescriptorSetSamplers
 >= 2048`. Stock MoltenVK on Apple Silicon reports **1,280 / 80** for
 those limits — the legacy Metal argument-table values — even though
 modern Apple GPUs with argument buffers can back millions of
-descriptors. Patch MoltenVK to expose the real numbers, drop the
-patched dylib into a wine prefix, and the game launches.
+descriptors. The intuition: patch MoltenVK to expose the real numbers,
+the gate passes, the game runs.
 
-| Limit | Vanilla MoltenVK 1.4.x | Patched | s&box minimum |
-|---|---|---|---|
-| `maxDescriptorSetSampledImages` | 1,280 | **1,000,000** | 65,536 |
-| `maxDescriptorSetSamplers` | 80 | **~500,000** (= M-chip's `maxArgumentBufferSamplerCount`) | 2,048 |
+The intuition was half right. The gate did pass. The game did launch
+to its main menu. **But under any non-trivial scene load, the engine
+allocated enough arg-buffer-backed descriptors that Metal couldn't
+service WindowServer's compositor frames — and macOS's userspace
+watchdog protected itself by panicking the system.**
 
-Tested on M4 Pro / macOS 26.4 — see [`docs/EVIDENCE.md`](docs/EVIDENCE.md)
-for actual probe output and `sbox.log` excerpts.
+Three patch values were tested. All three failed:
 
-## What's in here
+| Patch reports | Game | Result |
+|---|---|---|
+| `1,000,000 / ~500,000` (M-chip's actual `maxArgumentBufferSamplerCount`) | Sandbox + zoo | **Kernel panic + reboot** ~2 min after first `VK_TIMEOUT` |
+| `131,072 / 4,096` ("conservative") | Sandbox + zoo | **Kernel panic + reboot** within 2 min of scene load |
+| `65,537 / 2,049` (literally minimum-passing) + MVK queue throttling + low-quality video config | Sandbox + flatgrass | Render thread stalled at `QueuePresentAndWait()` within 30 s of gamemode init. Caught manually before WindowServer watchdog fired. |
+
+**The patch is the variable.** With vanilla MoltenVK, sbox.exe quits
+at the gate within 2 seconds of launch — no GPU stress, no panic,
+just no game. Every patched configuration produces GPU contention.
+
+Even at *one descriptor over* the engine's stated minimum, the engine
+allocated enough that the GPU couldn't be shared with the compositor.
+
+## What this repo still has of value
+
+This is the most thorough public writeup we know of explaining *why*
+s&box doesn't run on macOS Apple Silicon. Specifically:
 
 | Path | Purpose |
 |---|---|
-| [`moltenvk/descriptor-limits.patch`](moltenvk/descriptor-limits.patch) | The actual patch (~15 lines) against `MoltenVK/MoltenVK/GPUObjects/MVKDevice.mm`. Authored against [KhronosGroup/MoltenVK@dd34067](https://github.com/KhronosGroup/MoltenVK/commit/dd34067) (post-1.4.1 main). |
-| [`wine-wrapper/`](wine-wrapper/) | Mach-O C wrapper that lets you invoke a Wineskin/Sikarugir/Kegworks-derivative wine binary against a custom prefix with a custom MoltenVK on the dyld path. Solves the SIP-strips-DYLD-vars problem and the winetricks `lipo -archs` arch-detection problem. |
-| [`probe/`](probe/) | Tiny C program that links MoltenVK and prints the descriptor limits. Use it to verify the patch took effect. |
-| [`launcher/sbox-launcher.sh`](launcher/sbox-launcher.sh) | Bash launcher template. Configures all the MVK env vars, loops on Steam's exit-code-42-restart-me signal, can be wrapped in a `.app` bundle for a Dock icon. |
-| [`docs/DIAGNOSIS.md`](docs/DIAGNOSIS.md) | Full root-cause writeup. Read this if you want to understand *why* MoltenVK reports legacy limits and how the patch is consistent with the arg-buffer numbers MoltenVK already trusts internally. |
-| [`docs/BUILD.md`](docs/BUILD.md) | End-to-end setup guide: build patched MoltenVK, build the wrapper, set up an isolated wine prefix, install Steam, install s&box. |
-| [`docs/EVIDENCE.md`](docs/EVIDENCE.md) | Probe output before vs after the patch; the exact `sbox.log` lines that prove a passing launch. |
+| [`docs/DIAGNOSIS.md`](docs/DIAGNOSIS.md) | Root-cause analysis: where in MoltenVK's source the legacy limits are reported, why arg-buffers don't help, why the descriptor-indexing-extension high values aren't surfaced in the base properties. |
+| [`docs/CONCLUSION.md`](docs/CONCLUSION.md) | The full experimental record: every patch value tested, every observation, the kernel panic log, why each escalation didn't help, and what *would* fix this upstream. |
+| [`docs/EVIDENCE.md`](docs/EVIDENCE.md) | Probe output for vanilla and each patched dylib, sbox.log excerpts at every failure mode, panic log header. |
+| [`moltenvk/descriptor-limits.patch`](moltenvk/descriptor-limits.patch) | The patch itself. Triggers the failure mode described above. Useful only as a starting point for a properly-engineered fix that throttles or schedules around Metal's actual capacity. |
+| [`probe/`](probe/) | Standalone probe to read your machine's MoltenVK descriptor limits. Useful regardless of whether you're trying to run s&box. |
+| [`wine-wrapper/`](wine-wrapper/) | Mach-O C wrapper for invoking a Wineskin/Sikarugir/Kegworks-derivative wine binary against a custom prefix with a custom MoltenVK on the dyld path. Solves the SIP-strips-DYLD-vars problem and the winetricks `lipo -archs` arch-detection problem. Useful for anyone wanting to swap MoltenVK in any Wineskin-lineage setup. |
+| [`launcher/sbox-launcher.sh`](launcher/sbox-launcher.sh) | Bash launcher template with a self-kill watchdog that catches `VK_TIMEOUT` / `QueuePresentAndWait` distress signals before macOS does. Reduces panic risk if you do experiment with the patch. |
 
-## Quick start
+## What would actually fix this
 
-If you already have a Wineskin-derived wine bundle (Sikarugir, Kegworks, etc.):
+In rough order of accessibility:
 
-```sh
-# 1. Build patched MoltenVK
-git clone https://github.com/KhronosGroup/MoltenVK.git
-cd MoltenVK
-git apply ../sbox-macos/moltenvk/descriptor-limits.patch
-./fetchDependencies --macos
-make macos
-mkdir -p ~/sbox-rollyourown/moltenvk
-cp Package/Release/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib ~/sbox-rollyourown/moltenvk/
+1. **Facepunch enables `VK_EXT_descriptor_indexing` in s&box.** MoltenVK
+   already reports `maxDescriptorSetUpdateAfterBindSampledImages = 1e6`
+   in the descriptor-indexing extension's after-bind properties. If
+   s&box queried those (or just enabled the extension), the gate
+   passes naturally without any MoltenVK patch. This is small, in
+   their codebase, and would unblock every Mac player.
 
-# 2. Build the wine wrapper
-cd ../sbox-macos/wine-wrapper
-make
-PREFIX=~/sbox-rollyourown/bin make install
+2. **MoltenVK upstream surfaces realistic arg-buffer-backed limits in
+   the *base* `_properties.limits` when arg-buffers are configured.**
+   Discussed in [KhronosGroup/MoltenVK#2220](https://github.com/KhronosGroup/MoltenVK/issues/2220)
+   and similar issues. Would need careful pacing/scheduling on
+   MoltenVK's end to avoid the GPU-starvation pattern this repo
+   demonstrates exists.
 
-# 3. Verify the patch took effect
-cd ../probe
-ln -s ~/sbox-rollyourown/moltenvk/libMoltenVK.dylib libMoltenVK.dylib
-ln -s ../MoltenVK/MoltenVK/MoltenVK/include headers
-make VULKAN_HEADERS_DIR=headers
-MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=1 ./probe
-# expect maxDescriptorSetSampledImages: 1000000+
-```
+3. **Apple ships an arm64-native Source 2 backend or further GPTK
+   Metal-renderer support.** Open-ended.
 
-For the rest (initialize prefix, install Steam + winetricks deps,
-launch s&box), see [`docs/BUILD.md`](docs/BUILD.md).
-
-## Why this exists
-
-s&box has been shipping a Vulkan-1.0-without-`descriptor-indexing`
-renderer for a year+. MoltenVK has been correctly reporting *legacy*
-descriptor-table limits for that whole time. The two facts are
-consistent — Vulkan 1.0 spec leaves it to drivers what to report —
-but the practical effect is that s&box won't launch on any MacBook,
-ever, until someone (a) patches MoltenVK, (b) Facepunch enables
-descriptor-indexing, or (c) Apple ships a Metal-native Source 2
-renderer.
-
-(a) is small and tractable. This repo is (a).
-
-## What this isn't
-
-- **Not a fork of MoltenVK.** Just a patch. Apply it on top of upstream.
-  When upstream eventually surfaces these limits in the base properties
-  themselves, this repo becomes obsolete and that's fine.
-- **Not a wine distribution.** You bring your own (Sikarugir, Whisky,
-  Kegworks, CrossOver — anything that gives you a working wine binary
-  on Apple Silicon). The wrapper just lets you redirect MoltenVK
-  without modifying the bundle.
-- **Not a Steam shortcut.** Standard Steam Windows client running in
-  wine. The launcher just sets the right env vars before invoking it.
+4. **Hex-edit `sbox.exe` to skip the gate check.** Would let the
+   engine launch with vanilla MoltenVK reporting 1,280/80 — but the
+   engine probably *uses* those limits to size descriptor pools, so
+   it might just crash later. Untested. Steam will rewrite the binary
+   on update anyway. Mentioned for completeness.
 
 ## Status
 
-Working as of 2026-05-07 on M4 Pro / macOS 26.4 with Sikarugir
-(Wineskin fork) providing wine 10.0. Should work with any
-Wineskin-lineage wine bundle that supports a custom prefix +
-MoltenVK swap-in.
+**Doesn't work as of 2026-05-07 on M4 Pro / macOS 26.4 with Sikarugir
+(Wineskin fork) providing wine 10.0.**
 
-If it doesn't work for you: open an issue with your Mac chip,
-macOS version, wine bundle source, and the output of running the
-probe in [`probe/`](probe/) against both vanilla and patched
-MoltenVK dylibs.
+If you find a configuration that does work — particularly on different
+Apple Silicon (M1, M2 Max, M3, M4 Max), or with a different MVK queue
+configuration that actually shares the GPU with the compositor —
+please file an issue and tell us. We'd love to be wrong.
+
+If you experiment with the patch despite the warning above, please
+file an issue with your panic-full log if it bites you, so others
+can correlate failure modes.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
 The MoltenVK patch itself is offered for upstream consideration —
-KhronosGroup is welcome to incorporate the change directly under
-MoltenVK's existing Apache 2.0 license.
+KhronosGroup is welcome to incorporate the approach (or a properly
+scheduled version of it) under MoltenVK's existing Apache 2.0
+license.
 
 ## Credits
 
-Diagnostic + patch + writeup by [@ross631](https://github.com/ross631)
-with substantial pairing assistance from Claude (Anthropic).
+Diagnostic + experimental record by [@ross631](https://github.com/ross631)
+with pairing assistance from Claude (Anthropic).
 
 Built on top of:
-- [KhronosGroup/MoltenVK](https://github.com/KhronosGroup/MoltenVK) — the Vulkan-on-Metal layer this all depends on
-- [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) / Wineskin lineage — the wine bundles this works alongside
-- [Facepunch / s&box](https://sbox.game) — the game that finally made me chase this all the way down
+- [KhronosGroup/MoltenVK](https://github.com/KhronosGroup/MoltenVK)
+- [Sikarugir](https://github.com/Sikarugir-App/Sikarugir) / Wineskin lineage
+- [Facepunch / s&box](https://sbox.game)

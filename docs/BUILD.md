@@ -1,9 +1,37 @@
 # End-to-end setup guide
 
-This walks through standing up a new, isolated wine prefix that runs
-s&box on Apple Silicon, without touching any existing wine bundle's
-own prefix. Other games already running in your Wineskin/Sikarugir
-setup keep working.
+> ## ❌ This setup does not actually run s&box on M4 Pro
+>
+> See [`CONCLUSION.md`](CONCLUSION.md) for the experimental record:
+> three patch attempts, all hit the same GPU-contention failure mode,
+> first attempt escalated to a kernel panic + reboot.
+>
+> This guide is preserved for two reasons:
+> 1. As a *recipe* for building patched MoltenVK against arbitrary
+>    upstream commits, building the wine wrapper, setting up an
+>    isolated Wineskin-derived prefix, and running the descriptor
+>    probe — useful for anyone debugging similar Vulkan-on-Metal
+>    issues, even outside s&box.
+> 2. So the diagnosis writeup in this repo is reproducible end to end
+>    (anyone with similar hardware can rerun the probe and see the
+>    legacy 1,280 / 80 numbers, swap in patched MoltenVK and see
+>    1,000,000+, then watch the engine fail in the same way under
+>    sandbox-gamemode load).
+>
+> If you proceed with the patch despite the warning, the launcher in
+> [`../launcher/sbox-launcher.sh`](../launcher/sbox-launcher.sh)
+> includes a self-kill watchdog that catches `VK_TIMEOUT` /
+> `QueuePresentAndWait` distress signals before macOS's WindowServer
+> watchdog fires. That should reduce panic risk significantly. **It
+> won't make the game playable; it will just make the failure mode
+> survivable.**
+
+---
+
+This walks through standing up a new, isolated wine prefix
+designed to run s&box on Apple Silicon, without touching any
+existing wine bundle's own prefix. Other games already running in
+your Wineskin/Sikarugir setup keep working.
 
 ## Prerequisites
 

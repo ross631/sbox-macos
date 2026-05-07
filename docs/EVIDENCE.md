@@ -72,6 +72,13 @@ No `maxDescriptor* does not meet requirements` lines. No `Your graphics
 device does not meet minimum requirements`. The engine accepted the
 GPU, loaded the menu scene, brought up networking.
 
+**However:** the gate-pass is not the same thing as a working game.
+See [`CONCLUSION.md`](CONCLUSION.md) for what happens next under
+sandbox-gamemode load. Short version: the engine pre-pools
+descriptors based on the patched limits, GPU contention starves
+WindowServer, system panics. Three patch values tested
+(1,000,000 / 131,072 / 65,537), all failed in the same way.
+
 ## Kernel panic 2026-05-07
 
 After ~26 minutes of stable runtime in the menu, loading a sandbox
